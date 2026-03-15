@@ -2,12 +2,15 @@
 STIB/MIVB Wait Times PyScript for Home Assistant
 
 This script retrieves real-time wait times for STIB/MIVB public transport stops in Brussels
-using the OpenDataSoft API v2.1.
+using the new Belgian Mobility Open Data API.
 
 Installation:
 1. Enable PyScript in Home Assistant
-2. Place this file in /config/pyscript/stib_wait_times.py
-3. Restart Home Assistant or reload PyScript
+2. Create an account at https://api-management-opendata-production.developer.azure-api.net/signup
+3. Subscribe to the "Standard" product to get your API key
+4. Place this file in /config/pyscript/stib_wait_times.py
+5. Configure your API key and stops below
+6. Restart Home Assistant or reload PyScript
 
 Usage:
 The script will create sensors for each configured stop with attributes containing:
@@ -27,8 +30,10 @@ log.info("STIB Wait Times: Script file loaded successfully!")
 log.info("=" * 50)
 
 # ============= CONFIGURATION =============
-# API Key - Get yours from https://stibmivb.opendatasoft.com/account/
-API_KEY = "c841e3a9d63006ae4c4841d9e34ac9e62f6d99a68987a04cf2a1b323"
+# API Key - Get yours from https://api-management-opendata-production.developer.azure-api.net/
+# After signup, go to Profile -> Show -> Copy your "Primary key" or "Secondary key"
+API_KEY_PRIMARY = "YOUR_PRIMARY_KEY_HERE"
+API_KEY_SECONDARY = "YOUR_SECONDARY_KEY_HERE"  # Fallback if primary fails
 
 STOPS_CONFIG = [
     {
@@ -71,9 +76,11 @@ BUS_LINES = [
 PAUSE_START_TIME = "00:30"
 PAUSE_END_TIME = "06:00"
 
-# API Configuration
-API_BASE_URL = "https://stibmivb.opendatasoft.com/api/explore/v2.1"
-DATASET_ID = "waiting-time-rt-production"
+# API Configuration - New Belgian Mobility endpoints
+# The discovery API provides the actual endpoint URLs
+API_DISCOVERY_BASE = "https://api-management-discovery-production.azure-api.net/api/datasets"
+API_ENDPOINT_WAITING_TIMES = f"{API_DISCOVERY_BASE}/stibmivb/rt/WaitingTimes"
+
 UPDATE_INTERVAL = 60
 LANGUAGE = "fr"
 # ========================================
@@ -141,28 +148,45 @@ def is_within_pause_time():
         return False
 
 
-async def fetch_wait_times(stop_id):
-    """Fetch waiting times for a specific stop from the STIB API."""
-    url = f"{API_BASE_URL}/catalog/datasets/{DATASET_ID}/records"
+async def fetch_wait_times(stop_id, use_secondary_key=False):
+    """Fetch waiting times for a specific stop from the new Belgian Mobility API."""
     
-    params = {
-        "where": f"pointid={stop_id}",
-        "limit": 100
+    # Use primary or secondary key
+    api_key = API_KEY_SECONDARY if use_secondary_key else API_KEY_PRIMARY
+    
+    # The API seems to return all wait times, so we fetch everything and filter locally
+    url = f"{API_ENDPOINT_WAITING_TIMES}"
+    
+    # Try without parameters first - the API may return all data
+    headers = {
+        "Ocp-Apim-Subscription-Key": api_key,
+        "Accept": "application/json"
     }
-    
-    headers = {}
-    if API_KEY and API_KEY != "YOUR_API_KEY_HERE":
-        headers["Authorization"] = f"Apikey {API_KEY}"
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers) as response:
+            async with session.get(url, headers=headers) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    log.error(f"STIB API Error for stop {stop_id}: {response.status} - {error_text}")
+                    log.error(f"STIB API Error: {response.status} - {error_text[:200]}")
+                    
+                    # If primary key failed, try secondary
+                    if not use_secondary_key and response.status in [401, 403]:
+                        log.warning(f"Primary key failed, trying secondary key")
+                        return await fetch_wait_times(stop_id, use_secondary_key=True)
+                    
                     return None
                 
                 data = await response.json()
+                
+                # Filter the results for our specific stop
+                if "results" in data:
+                    filtered_results = [
+                        r for r in data["results"] 
+                        if r.get("pointid") == str(stop_id)
+                    ]
+                    return {"results": filtered_results}
+                
                 return data
     except Exception as e:
         log.error(f"Error fetching data for stop {stop_id}: {e}")
@@ -183,8 +207,9 @@ async def update_stop(stop_config):
         log.error(f"STIB: Failed to fetch data for stop {stop_id}")
         return
     
+    # The API returns data in the same structure as the old OpenDataSoft API
     if "results" not in data:
-        log.error(f"STIB: No 'results' in response for stop {stop_id}")
+        log.error(f"STIB: No 'results' in response for stop {stop_id}. Response: {json.dumps(data)[:200]}")
         return
     
     records = data.get("results", [])
@@ -198,14 +223,14 @@ async def update_stop(stop_config):
     # Group records by line number
     lines_data = {}
     for record in records:
-        fields = record.get("pointid") and record or record.get("record", {}).get("fields", {})
-        
-        line_id = fields.get("lineid")
+        # The fields are at the top level of each record
+        line_id = record.get("lineid")
         if not line_id:
             continue
         
         line_id_str = str(line_id)
         
+        # Filter by configured lines if specified
         if filter_lines:
             try:
                 if int(line_id) not in filter_lines:
@@ -216,7 +241,7 @@ async def update_stop(stop_config):
         if line_id_str not in lines_data:
             lines_data[line_id_str] = []
         
-        lines_data[line_id_str].append(fields)
+        lines_data[line_id_str].append(record)
     
     log.info(f"STIB: Processing {len(lines_data)} lines for stop {stop_id}: {list(lines_data.keys())}")
     
@@ -240,10 +265,11 @@ async def process_line(stop_id, stop_name, line_id, line_records):
     if not line_records:
         return
     
+    # Get the first record for this line
     record = line_records[0]
     passing_times_raw = record.get("passingtimes", "[]")
     
-    # Parse JSON string
+    # Parse JSON string (passingtimes is a JSON string, not an object)
     try:
         if isinstance(passing_times_raw, str):
             passing_times_list = json.loads(passing_times_raw)
@@ -253,7 +279,7 @@ async def process_line(stop_id, stop_name, line_id, line_records):
         log.error(f"STIB: Error parsing JSON for {sensor_name}: {e}")
         passing_times_list = []
     
-    # Extract passages
+    # Extract next 2 passages
     next_passages = []
     for passage in passing_times_list[:2]:
         destination = passage.get("destination", {})
@@ -305,7 +331,7 @@ async def process_line(stop_id, stop_name, line_id, line_records):
         "line_type": line_type,
         "icon": get_icon(line_type),
         "unit_of_measurement": "min",
-        "attribution": "Data provided by STIB-MIVB OpenData",
+        "attribution": "Data provided by Belgian Mobility Open Data",
         "device_class": "duration"
     }
     
@@ -384,10 +410,12 @@ async def stib_update_single_stop(stop_id=None):
 async def stib_debug_info():
     """Service to test and show debug information."""
     log.error("STIB DEBUG: Running debug")
-    log.error(f"STIB DEBUG: API Key configured: {API_KEY != 'YOUR_API_KEY_HERE'}")
+    log.error(f"STIB DEBUG: Primary API Key configured: {API_KEY_PRIMARY != 'YOUR_PRIMARY_KEY_HERE'}")
+    log.error(f"STIB DEBUG: Secondary API Key configured: {API_KEY_SECONDARY != 'YOUR_SECONDARY_KEY_HERE'}")
     log.error(f"STIB DEBUG: Stops configured: {len(STOPS_CONFIG)}")
     log.error(f"STIB DEBUG: Pause active: {is_within_pause_time()}")
     log.error(f"STIB DEBUG: Current time: {datetime.now().strftime('%H:%M:%S')}")
+    log.error(f"STIB DEBUG: API Endpoint: {API_ENDPOINT_WAITING_TIMES}")
     
     if STOPS_CONFIG:
         first_stop = STOPS_CONFIG[0]
@@ -396,6 +424,10 @@ async def stib_debug_info():
         data = await fetch_wait_times(first_stop['stop_id'])
         
         if data:
-            log.error(f"STIB DEBUG: Got {len(data.get('results', []))} results")
+            log.error(f"STIB DEBUG: API call successful! Response structure: {list(data.keys())}")
+            if 'results' in data:
+                log.error(f"STIB DEBUG: Got {len(data.get('results', []))} results")
+                if data['results']:
+                    log.error(f"STIB DEBUG: First result sample: {json.dumps(data['results'][0])[:300]}")
         else:
             log.error("STIB DEBUG: No data returned")
